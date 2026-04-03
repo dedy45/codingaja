@@ -24,6 +24,9 @@ impl HookEvent {
 pub struct HookRunResult {
     denied: bool,
     messages: Vec<String>,
+    rewritten_input: Option<String>,
+    rewritten_output: Option<String>,
+    override_is_error: Option<bool>,
 }
 
 impl HookRunResult {
@@ -32,6 +35,9 @@ impl HookRunResult {
         Self {
             denied: false,
             messages,
+            rewritten_input: None,
+            rewritten_output: None,
+            override_is_error: None,
         }
     }
 
@@ -43,6 +49,21 @@ impl HookRunResult {
     #[must_use]
     pub fn messages(&self) -> &[String] {
         &self.messages
+    }
+
+    #[must_use]
+    pub fn rewritten_input(&self) -> Option<&str> {
+        self.rewritten_input.as_deref()
+    }
+
+    #[must_use]
+    pub fn rewritten_output(&self) -> Option<&str> {
+        self.rewritten_output.as_deref()
+    }
+
+    #[must_use]
+    pub fn override_is_error(&self) -> Option<bool> {
+        self.override_is_error
     }
 }
 
@@ -59,6 +80,14 @@ struct HookCommandRequest<'a> {
     tool_output: Option<&'a str>,
     is_error: bool,
     payload: &'a str,
+}
+
+#[derive(Debug, Default)]
+struct HookCommandEffects {
+    message: Option<String>,
+    rewritten_input: Option<String>,
+    rewritten_output: Option<String>,
+    override_is_error: Option<bool>,
 }
 
 impl HookRunner {
@@ -126,6 +155,9 @@ impl HookRunner {
         .to_string();
 
         let mut messages = Vec::new();
+        let mut rewritten_input = None;
+        let mut rewritten_output = None;
+        let mut override_is_error = None;
 
         for command in commands {
             match Self::run_command(
@@ -139,26 +171,53 @@ impl HookRunner {
                     payload: &payload,
                 },
             ) {
-                HookCommandOutcome::Allow { message } => {
-                    if let Some(message) = message {
+                HookCommandOutcome::Allow { effects } => {
+                    if let Some(message) = effects.message {
                         messages.push(message);
                     }
+                    if let Some(value) = effects.rewritten_input {
+                        rewritten_input = Some(value);
+                    }
+                    if let Some(value) = effects.rewritten_output {
+                        rewritten_output = Some(value);
+                    }
+                    if let Some(value) = effects.override_is_error {
+                        override_is_error = Some(value);
+                    }
                 }
-                HookCommandOutcome::Deny { message } => {
-                    let message = message.unwrap_or_else(|| {
+                HookCommandOutcome::Deny { effects } => {
+                    let message = effects.message.unwrap_or_else(|| {
                         format!("{} hook denied tool `{tool_name}`", event.as_str())
                     });
                     messages.push(message);
+                    if let Some(value) = effects.rewritten_input {
+                        rewritten_input = Some(value);
+                    }
+                    if let Some(value) = effects.rewritten_output {
+                        rewritten_output = Some(value);
+                    }
+                    if let Some(value) = effects.override_is_error {
+                        override_is_error = Some(value);
+                    }
                     return HookRunResult {
                         denied: true,
                         messages,
+                        rewritten_input,
+                        rewritten_output,
+                        override_is_error,
                     };
                 }
                 HookCommandOutcome::Warn { message } => messages.push(message),
             }
         }
 
-        HookRunResult::allow(messages)
+        HookRunResult {
+            denied: false,
+            messages,
+            rewritten_input,
+            rewritten_output,
+            override_is_error,
+        }
     }
 
     fn run_command(command: &str, request: HookCommandRequest<'_>) -> HookCommandOutcome {
@@ -181,15 +240,15 @@ impl HookRunner {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let message = (!stdout.is_empty()).then_some(stdout);
+                let effects = parse_hook_stdout(&stdout);
                 match output.status.code() {
-                    Some(0) => HookCommandOutcome::Allow { message },
-                    Some(2) => HookCommandOutcome::Deny { message },
+                    Some(0) => HookCommandOutcome::Allow { effects },
+                    Some(2) => HookCommandOutcome::Deny { effects },
                     Some(code) => HookCommandOutcome::Warn {
                         message: format_hook_warning(
                             command,
                             code,
-                            message.as_deref(),
+                            effects.message.as_deref(),
                             stderr.as_str(),
                         ),
                     },
@@ -214,9 +273,49 @@ impl HookRunner {
 }
 
 enum HookCommandOutcome {
-    Allow { message: Option<String> },
-    Deny { message: Option<String> },
+    Allow { effects: HookCommandEffects },
+    Deny { effects: HookCommandEffects },
     Warn { message: String },
+}
+
+fn parse_hook_stdout(stdout: &str) -> HookCommandEffects {
+    let mut messages = Vec::new();
+    let mut effects = HookCommandEffects::default();
+
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(value) = line.strip_prefix("HOOK_REWRITE_INPUT:") {
+            effects.rewritten_input = Some(value.trim().to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("HOOK_REWRITE_OUTPUT:") {
+            effects.rewritten_output = Some(value.trim().to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("HOOK_OVERRIDE_IS_ERROR:") {
+            effects.override_is_error = parse_bool_directive(value.trim());
+            continue;
+        }
+        messages.push(line.to_string());
+    }
+
+    effects.message = if messages.is_empty() {
+        None
+    } else {
+        Some(messages.join("\n"))
+    };
+    effects
+}
+
+fn parse_bool_directive(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" => Some(true),
+        "0" | "false" | "no" | "n" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_tool_input(tool_input: &str) -> serde_json::Value {
@@ -238,7 +337,7 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -343,6 +442,27 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message.contains("allowing tool execution to continue")));
+    }
+
+    #[test]
+    fn captures_rewrite_and_result_mutation_directives() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet(
+                "printf 'HOOK_REWRITE_INPUT:{\"value\":42}\\npre ran'",
+            )],
+            vec![shell_snippet(
+                "printf 'HOOK_REWRITE_OUTPUT:mutated\\nHOOK_OVERRIDE_IS_ERROR:false\\npost ran'",
+            )],
+        ));
+
+        let pre = runner.run_pre_tool_use("Edit", r#"{"value":1}"#);
+        assert_eq!(pre.rewritten_input(), Some("{\"value\":42}"));
+        assert_eq!(pre.messages(), &["pre ran".to_string()]);
+
+        let post = runner.run_post_tool_use("Edit", r#"{"value":42}"#, "orig", true);
+        assert_eq!(post.rewritten_output(), Some("mutated"));
+        assert_eq!(post.override_is_error(), Some(false));
+        assert_eq!(post.messages(), &["post ran".to_string()]);
     }
 
     #[cfg(windows)]

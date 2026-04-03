@@ -117,6 +117,9 @@ class PortingWorkspaceTests(unittest.TestCase):
 
         session = PortRuntime().bootstrap_session('review MCP tool', limit=5)
         self.assertGreaterEqual(len(session.turn_result.matched_tools), 1)
+        self.assertGreaterEqual(len(session.stream_events), 2)
+        self.assertEqual(session.stream_events[0]['type'], 'message_start')
+        self.assertEqual(session.stream_events[-1]['type'], 'message_stop')
         self.assertIn('Prompt:', session.turn_result.output)
         self.assertGreaterEqual(session.turn_result.usage.input_tokens, 1)
 

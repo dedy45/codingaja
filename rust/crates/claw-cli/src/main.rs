@@ -19,6 +19,7 @@ use api::{
     resolve_startup_auth_source, ClawApiClient, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ProviderClient,
 };
 
 use commands::{
@@ -70,7 +71,78 @@ Run `claw --help` for usage."
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let action = parse_args(&args)?;
+
+    // Read model from config if CLI used default model
+    let action = match action {
+        CliAction::Repl {
+            model,
+            allowed_tools,
+            permission_mode,
+        } if model == DEFAULT_MODEL => {
+            let cwd = env::current_dir()?;
+            if let Ok(config) = ConfigLoader::default_for(&cwd).load() {
+                if let Some(config_model) = config.model() {
+                    CliAction::Repl {
+                        model: resolve_model_alias(config_model).to_string(),
+                        allowed_tools,
+                        permission_mode,
+                    }
+                } else {
+                    CliAction::Repl {
+                        model,
+                        allowed_tools,
+                        permission_mode,
+                    }
+                }
+            } else {
+                CliAction::Repl {
+                    model,
+                    allowed_tools,
+                    permission_mode,
+                }
+            }
+        }
+        CliAction::Prompt {
+            prompt,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+        } if model == DEFAULT_MODEL => {
+            let cwd = env::current_dir()?;
+            if let Ok(config) = ConfigLoader::default_for(&cwd).load() {
+                if let Some(config_model) = config.model() {
+                    CliAction::Prompt {
+                        prompt,
+                        model: resolve_model_alias(config_model).to_string(),
+                        output_format,
+                        allowed_tools,
+                        permission_mode,
+                    }
+                } else {
+                    CliAction::Prompt {
+                        prompt,
+                        model,
+                        output_format,
+                        allowed_tools,
+                        permission_mode,
+                    }
+                }
+            } else {
+                CliAction::Prompt {
+                    prompt,
+                    model,
+                    output_format,
+                    allowed_tools,
+                    permission_mode,
+                }
+            }
+        }
+        other => other,
+    };
+
+    match action {
         CliAction::DumpManifests => dump_manifests(),
         CliAction::BootstrapPlan => print_bootstrap_plan(),
         CliAction::Agents { args } => LiveCli::print_agents(args.as_deref())?,
@@ -532,24 +604,17 @@ fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn open_browser(url: &str) -> io::Result<()> {
-    let commands = if cfg!(target_os = "macos") {
-        vec![("open", vec![url])]
+    if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).spawn().map(|_| ())
     } else if cfg!(target_os = "windows") {
-        vec![("cmd", vec!["/C", "start", "", url])]
+        let quoted_url = format!("\"{}\"", url);
+        Command::new("cmd")
+            .args(["/C", "start", "\"\"", &quoted_url])
+            .spawn()
+            .map(|_| ())
     } else {
-        vec![("xdg-open", vec![url])]
-    };
-    for (program, args) in commands {
-        match Command::new(program).args(args).spawn() {
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+        Command::new("xdg-open").arg(url).spawn().map(|_| ())
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "no supported browser opener command found",
-    ))
 }
 
 fn wait_for_oauth_callback(
@@ -2250,7 +2315,7 @@ fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn command_exists(name: &str) -> bool {
-    Command::new("which")
+    if cfg!(windows) { Command::new("where") } else { Command::new("which") }
         .arg(name)
         .output()
         .map(|output| output.status.success())
@@ -2873,7 +2938,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct DefaultRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: ClawApiClient,
+    client: ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -2891,10 +2956,10 @@ impl DefaultRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let client = ProviderClient::from_model(&model)?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: ClawApiClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url()),
+            client,
             model,
             enable_tools,
             emit_output,
@@ -2905,6 +2970,7 @@ impl DefaultRuntimeClient {
     }
 }
 
+#[allow(dead_code)]
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_startup_auth_source(|| {
         let cwd = env::current_dir().map_err(api::ApiError::from)?;

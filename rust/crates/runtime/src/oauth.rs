@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs;
+use std::io::{self};
 use std::path::PathBuf;
 
+use getrandom::getrandom;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -319,7 +320,7 @@ pub fn parse_oauth_callback_query(query: &str) -> Result<OAuthCallbackParams, St
 
 fn generate_random_token(bytes: usize) -> io::Result<String> {
     let mut buffer = vec![0_u8; bytes];
-    File::open("/dev/urandom")?.read_exact(&mut buffer)?;
+    getrandom(&mut buffer).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     Ok(base64url_encode(&buffer))
 }
 
@@ -328,11 +329,17 @@ fn credentials_home_dir() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     let home = std::env::var_os("HOME")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "HOME and USERPROFILE are not set")
+        })?;
     Ok(PathBuf::from(home).join(".claw"))
 }
 
 fn read_credentials_root(path: &PathBuf) -> io::Result<Map<String, Value>> {
+    if !path.parent().map_or(true, |p| p.exists()) {
+        return Ok(Map::new());
+    }
     match fs::read_to_string(path) {
         Ok(contents) => {
             if contents.trim().is_empty() {

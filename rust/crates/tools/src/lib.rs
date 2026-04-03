@@ -498,6 +498,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             description: "Return structured output in the requested format.",
             input_schema: json!({
                 "type": "object",
+                "properties": {
+                    "data": {
+                        "type": "object",
+                        "description": "Arbitrary structured data"
+                    }
+                },
                 "additionalProperties": true
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -1470,7 +1476,18 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
         candidates.push(home.join(".config").join("opencode").join("skills"));
         candidates.push(home.join(".codex").join("skills"));
     }
+    if cfg!(target_os = "windows") {
+        if let Ok(userprofile) = std::env::var("USERPROFILE") {
+            let home = std::path::PathBuf::from(userprofile);
+            candidates.push(home.join(".agents").join("skills"));
+            candidates.push(home.join(".config").join("opencode").join("skills"));
+            candidates.push(home.join(".codex").join("skills"));
+        }
+    }
     candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
+    if !cfg!(target_os = "windows") {
+        // This path is Linux-only, skip on Windows
+    }
 
     for root in candidates {
         let direct = root.join(requested).join("SKILL.md");
@@ -2579,11 +2596,33 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
                 .ok_or_else(|| String::from("node runtime not found"))?,
             args: &["-e"],
         }),
-        "sh" | "shell" | "bash" => Ok(ReplRuntime {
-            program: detect_first_command(&["bash", "sh"])
-                .ok_or_else(|| String::from("shell runtime not found"))?,
-            args: &["-lc"],
-        }),
+        "sh" | "shell" | "bash" => {
+            if cfg!(target_os = "windows") {
+                Ok(ReplRuntime {
+                    program: detect_first_command(&["cmd"])
+                        .ok_or_else(|| String::from("cmd runtime not found"))?,
+                    args: &["/C"],
+                })
+            } else {
+                Ok(ReplRuntime {
+                    program: detect_first_command(&["bash", "sh"])
+                        .ok_or_else(|| String::from("shell runtime not found"))?,
+                    args: &["-lc"],
+                })
+            }
+        }
+        "powershell" | "ps1" | "pwsh" => {
+            if cfg!(target_os = "windows") {
+                let shell = detect_first_command(&["pwsh", "powershell"])
+                    .ok_or_else(|| String::from("powershell runtime not found"))?;
+                Ok(ReplRuntime {
+                    program: shell,
+                    args: &["-NoProfile", "-NonInteractive", "-Command"],
+                })
+            } else {
+                Err(String::from("powershell is only available on Windows"))
+            }
+        }
         other => Err(format!("unsupported REPL language: {other}")),
     }
 }
@@ -2762,7 +2801,9 @@ fn config_home_dir() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("CLAW_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var("HOME").map_err(|_| String::from("HOME is not set"))?;
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| String::from("HOME and USERPROFILE are not set"))?;
     Ok(PathBuf::from(home).join(".claw"))
 }
 
@@ -2861,12 +2902,22 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    if cfg!(target_os = "windows") {
+        std::process::Command::new("where")
+            .arg(command)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    } else {
+        std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(format!("command -v {command} >/dev/null 2>&1"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4300,22 +4351,24 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create dir");
         let script = dir.join("pwsh");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
-shift
-printf 'pwsh:%s' "$1"
-"#,
-        )
-        .expect("write script");
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
+        if cfg!(target_os = "windows") {
+            std::fs::write(&script, "@echo off\r\nshift\r\nshift\r\necho pwsh:%1\r\n")
+                .expect("write script");
+        } else {
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nwhile [ \"$1\" != \"-Command\" ] && [ $# -gt 0 ]; do shift; done\nshift\nprintf 'pwsh:%s' \"$1\"\n",
+            )
+            .expect("write script");
+            std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(&script)
+                .status()
+                .expect("chmod");
+        }
         let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
+        std::env::set_var("PATH", format!("{}{}{}", dir.display(), sep, original_path));
 
         let result = execute_tool(
             "PowerShell",

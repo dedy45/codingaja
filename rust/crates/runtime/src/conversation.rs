@@ -209,6 +209,7 @@ where
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         let pre_hook_result = self.hook_runner.run_pre_tool_use(&tool_name, &input);
+                        let effective_input = pre_hook_result.rewritten_input().unwrap_or(&input);
                         if pre_hook_result.is_denied() {
                             let deny_message = format!("PreToolUse hook denied tool `{tool_name}`");
                             ConversationMessage::tool_result(
@@ -219,17 +220,26 @@ where
                             )
                         } else {
                             let (mut output, mut is_error) =
-                                match self.tool_executor.execute(&tool_name, &input) {
+                                match self.tool_executor.execute(&tool_name, effective_input) {
                                     Ok(output) => (output, false),
                                     Err(error) => (error.to_string(), true),
                                 };
                             output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
-                            let post_hook_result = self
-                                .hook_runner
-                                .run_post_tool_use(&tool_name, &input, &output, is_error);
+                            let post_hook_result = self.hook_runner.run_post_tool_use(
+                                &tool_name,
+                                effective_input,
+                                &output,
+                                is_error,
+                            );
                             if post_hook_result.is_denied() {
                                 is_error = true;
+                            }
+                            if let Some(rewritten_output) = post_hook_result.rewritten_output() {
+                                output = rewritten_output.to_string();
+                            }
+                            if let Some(override_is_error) = post_hook_result.override_is_error() {
+                                is_error = override_is_error;
                             }
                             output = merge_hook_feedback(
                                 post_hook_result.messages(),

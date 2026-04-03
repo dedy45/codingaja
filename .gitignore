@@ -1,7 +1,19 @@
 __pycache__/
 archive/
 .omx/
-.clawd-agents/
-# Claude Code local artifacts
+.claude/
 .claude/settings.local.json
 .claude/sessions/
+.claw/settings.local.json
+.claw/sessions/
+.claw/credentials.json
+.claw-todos.json
+.port_sessions/
+.coverage
+uv.lock
+.venv/
+target/
+*.pdb
+*.exp
+*.lib
+*.locked

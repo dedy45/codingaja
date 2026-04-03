@@ -1154,6 +1154,21 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
             home.join(".claw").join(leaf),
         );
     }
+    if cfg!(target_os = "windows") {
+        if let Some(userprofile) = env::var_os("USERPROFILE") {
+            let home = PathBuf::from(userprofile);
+            push_unique_root(
+                &mut roots,
+                DefinitionSource::UserCodex,
+                home.join(".codex").join(leaf),
+            );
+            push_unique_root(
+                &mut roots,
+                DefinitionSource::UserClaw,
+                home.join(".claw").join(leaf),
+            );
+        }
+    }
 
     roots
 }
@@ -1230,6 +1245,35 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             home.join(".claw").join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(userprofile) = env::var_os("USERPROFILE") {
+            let home = PathBuf::from(userprofile);
+            push_unique_skill_root(
+                &mut roots,
+                DefinitionSource::UserCodex,
+                home.join(".codex").join("skills"),
+                SkillOrigin::SkillsDir,
+            );
+            push_unique_skill_root(
+                &mut roots,
+                DefinitionSource::UserCodex,
+                home.join(".codex").join("commands"),
+                SkillOrigin::LegacyCommandsDir,
+            );
+            push_unique_skill_root(
+                &mut roots,
+                DefinitionSource::UserClaw,
+                home.join(".claw").join("skills"),
+                SkillOrigin::SkillsDir,
+            );
+            push_unique_skill_root(
+                &mut roots,
+                DefinitionSource::UserClaw,
+                home.join(".claw").join("commands"),
+                SkillOrigin::LegacyCommandsDir,
+            );
+        }
     }
 
     roots
