@@ -17,3 +17,13 @@ target/
 *.exp
 *.lib
 *.locked
+leak/
+.mypy_cache/
+.github/
+.pytest_cache/
+.ruff_cache/
+.sandbox-home/
+.sandbox-tmp/
+.serena/
+docs/
+.claw/

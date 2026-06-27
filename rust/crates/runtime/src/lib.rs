@@ -13,6 +13,8 @@ mod oauth;
 mod permissions;
 mod prompt;
 mod remote;
+mod task_registry;
+mod team_cron_registry;
 pub mod sandbox;
 mod session;
 mod usage;
@@ -70,6 +72,11 @@ pub use oauth::{
 pub use permissions::{
     PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
     PermissionPrompter, PermissionRequest,
+};
+pub use task_registry::{TaskRecord, TaskRegistry, TaskStatus, global_task_registry};
+pub use team_cron_registry::{
+    CronRecord, CronRegistry, TeamRecord, TeamRegistry, global_cron_registry,
+    global_team_registry,
 };
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,

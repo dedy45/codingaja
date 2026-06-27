@@ -118,6 +118,19 @@ uv run python -m src.main summary
 
 See [`KONFIGURASI.md`](KONFIGURASI.md) for complete config reference.
 
+## Parity Work
+
+If you want to continue the TypeScript-to-Rust parity work from `leak/src`, use these docs first:
+
+- [`docs/PARITY_STATUS.md`](docs/PARITY_STATUS.md) — current parity truth for this workspace
+- [`docs/PARITY_TOOL_MATRIX.md`](docs/PARITY_TOOL_MATRIX.md) — generated tool-by-tool implementation matrix
+- [`docs/PARITY_IMPLEMENTATION_PATTERN.md`](docs/PARITY_IMPLEMENTATION_PATTERN.md) — exact TS -> Rust implementation pattern
+- [`docs/PARITY_ROADMAP.md`](docs/PARITY_ROADMAP.md) — recommended lane order for completing parity
+
+The generator for the tool matrix lives at:
+
+- `docs/parity/generate_tool_parity_matrix.py`
+
 Config file locations (priority low → high):
 1. `%USERPROFILE%\.claw.json` — global user (legacy)
 2. `%USERPROFILE%\.claw\settings.json` — global user

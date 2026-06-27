@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use api::{
@@ -13,8 +14,12 @@ use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
     ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
-    ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    ConfigLoader, ConversationRuntime, GrepSearchInput, LspManager, LspServerConfig,
+    McpListResourcesResult, McpListToolsResult, McpReadResourceResult, McpReadResourceParams,
+    McpServerManager, McpToolCallResult, MessageRole, PermissionMode, PermissionPolicy,
+    RuntimeError, Session,
+    TaskRecord, TaskStatus, TokenUsage, ToolError, ToolExecutor, global_cron_registry,
+    global_task_registry, global_team_registry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -478,6 +483,27 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "Brief",
+            description: "Send a brief message or notification to the user.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" },
+                    "attachments": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["normal", "proactive"]
+                    }
+                },
+                "required": ["message", "status"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "Config",
             description: "Get or set Claw Code settings.",
             input_schema: json!({
@@ -539,6 +565,331 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        ToolSpec {
+            name: "AskUserQuestion",
+            description: "Collect structured clarification answers from the user.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": { "type": "string" },
+                                "header": { "type": "string" },
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string" },
+                                            "description": { "type": "string" }
+                                        },
+                                        "required": ["label", "description"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "multiSelect": { "type": "boolean" }
+                            },
+                            "required": ["question", "header", "options"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "answers": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["questions"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "EnterPlanMode",
+            description: "Enter planning mode before implementation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ExitPlanMode",
+            description: "Exit planning mode after drafting an approach.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "EnterWorktree",
+            description: "Create and enter an isolated worktree context.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "ExitWorktree",
+            description: "Exit current worktree session and optionally remove it.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["keep", "remove"] },
+                    "discard_changes": { "type": "boolean" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TaskCreate",
+            description: "Create a task in the current task list.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "subject": { "type": "string" },
+                    "description": { "type": "string" },
+                    "activeForm": { "type": "string" },
+                    "metadata": { "type": "object", "additionalProperties": true }
+                },
+                "required": ["subject", "description"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TaskGet",
+            description: "Get one task by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" }
+                },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskList",
+            description: "List all tasks.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskUpdate",
+            description: "Update task fields and status.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "description": { "type": "string" },
+                    "activeForm": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "failed", "stopped", "deleted"] },
+                    "owner": { "type": "string" },
+                    "addBlocks": { "type": "array", "items": { "type": "string" } },
+                    "addBlockedBy": { "type": "array", "items": { "type": "string" } },
+                    "metadata": { "type": "object", "additionalProperties": true }
+                },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TaskStop",
+            description: "Stop an active task by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "shell_id": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TaskOutput",
+            description: "Read output from a task by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "block": { "type": "boolean" },
+                    "timeout": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TeamCreate",
+            description: "Create a swarm team context.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "agent_type": { "type": "string" }
+                },
+                "required": ["team_name"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TeamDelete",
+            description: "Delete current team context.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "CronCreate",
+            description: "Create a cron schedule entry.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cron": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "recurring": { "type": "boolean" },
+                    "durable": { "type": "boolean" },
+                    "team_name": { "type": "string" }
+                },
+                "required": ["cron", "prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "CronDelete",
+            description: "Delete a cron schedule entry by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "CronList",
+            description: "List cron schedule entries.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ListMcpResources",
+            description: "List resources from MCP server(s).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ReadMcpResource",
+            description: "Read one MCP resource by URI.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "uri": { "type": "string" }
+                },
+                "required": ["server", "uri"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "McpAuth",
+            description: "Start MCP server authentication guidance flow.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "MCP",
+            description: "Call an MCP tool by server/tool name.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "tool": { "type": "string" },
+                    "arguments": { "type": "object", "additionalProperties": true }
+                },
+                "required": ["server", "tool"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "LSP",
+            description: "Run language-server operations for a file.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "operation": { "type": "string", "enum": ["definition", "references", "diagnostics", "hover", "symbols"] },
+                    "filePath": { "type": "string" },
+                    "line": { "type": "integer", "minimum": 1 },
+                    "character": { "type": "integer", "minimum": 1 },
+                    "includeDeclaration": { "type": "boolean" }
+                },
+                "required": ["operation", "filePath"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "RemoteTrigger",
+            description: "Manage remote trigger records.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "get", "create", "update", "run"] },
+                    "trigger_id": { "type": "string" },
+                    "body": { "type": "object", "additionalProperties": true }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
     ]
 }
 
@@ -565,6 +916,34 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         }
         "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
         "PowerShell" => from_value::<PowerShellInput>(input).and_then(run_powershell),
+        "AskUserQuestion" => {
+            from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
+        }
+        "EnterPlanMode" => from_value::<EmptyInput>(input).and_then(run_enter_plan_mode),
+        "ExitPlanMode" => from_value::<EmptyInput>(input).and_then(run_exit_plan_mode),
+        "EnterWorktree" => from_value::<EnterWorktreeInput>(input).and_then(run_enter_worktree),
+        "ExitWorktree" => from_value::<ExitWorktreeInput>(input).and_then(run_exit_worktree),
+        "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
+        "TaskGet" => from_value::<TaskGetInput>(input).and_then(run_task_get),
+        "TaskList" => from_value::<EmptyInput>(input).and_then(run_task_list),
+        "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
+        "TaskStop" => from_value::<TaskStopInput>(input).and_then(run_task_stop),
+        "TaskOutput" => from_value::<TaskOutputInput>(input).and_then(run_task_output),
+        "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
+        "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
+        "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
+        "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
+        "CronList" => from_value::<EmptyInput>(input).and_then(run_cron_list),
+        "ListMcpResources" => {
+            from_value::<ListMcpResourcesInput>(input).and_then(run_list_mcp_resources)
+        }
+        "ReadMcpResource" => {
+            from_value::<ReadMcpResourceInput>(input).and_then(run_read_mcp_resource)
+        }
+        "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
+        "MCP" => from_value::<McpToolCallInput>(input).and_then(run_mcp_call),
+        "LSP" => from_value::<LspToolInput>(input).and_then(run_lsp),
+        "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
@@ -663,6 +1042,642 @@ fn run_repl(input: ReplInput) -> Result<String, String> {
 
 fn run_powershell(input: PowerShellInput) -> Result<String, String> {
     to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
+}
+
+fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+    if input.questions.is_empty() {
+        return Err(String::from("questions must not be empty"));
+    }
+    let mut answers = input.answers.unwrap_or_default();
+    for question in &input.questions {
+        if !answers.contains_key(&question.question) {
+            let fallback = question
+                .options
+                .first()
+                .map(|option| option.label.clone())
+                .unwrap_or_default();
+            answers.insert(question.question.clone(), fallback);
+        }
+    }
+    to_pretty_json(AskUserQuestionOutput {
+        questions: input.questions,
+        answers,
+    })
+}
+
+fn run_enter_plan_mode(_input: EmptyInput) -> Result<String, String> {
+    let mut guard = plan_mode_state()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = true;
+    to_pretty_json(json!({
+        "message": "Entered plan mode. Focus on exploration and design before coding.",
+        "plan_mode": true
+    }))
+}
+
+fn run_exit_plan_mode(_input: EmptyInput) -> Result<String, String> {
+    let mut guard = plan_mode_state()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = false;
+    to_pretty_json(json!({
+        "message": "Exited plan mode. Implementation can proceed.",
+        "plan_mode": false
+    }))
+}
+
+fn run_enter_worktree(input: EnterWorktreeInput) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let name = input.name.unwrap_or_else(|| {
+        format!(
+            "wt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        )
+    });
+    let path = cwd.join(".claw").join("worktrees").join(&name);
+    std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    let state = WorktreeState {
+        name: name.clone(),
+        path: path.display().to_string(),
+        branch: Some(format!("worktree/{name}")),
+    };
+    let mut guard = worktree_state()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(state.clone());
+    to_pretty_json(WorktreeOutput {
+        message: format!("Created worktree at {}", state.path),
+        worktree_path: Some(state.path),
+        worktree_branch: state.branch,
+    })
+}
+
+fn run_exit_worktree(input: ExitWorktreeInput) -> Result<String, String> {
+    let mut guard = worktree_state()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(state) = guard.clone() else {
+        return to_pretty_json(WorktreeOutput {
+            message: String::from("No active worktree session"),
+            worktree_path: None,
+            worktree_branch: None,
+        });
+    };
+    if input.action == "remove" {
+        let should_discard = input.discard_changes.unwrap_or(false);
+        if !should_discard {
+            return Err(String::from(
+                "remove requires discard_changes=true to avoid accidental data loss",
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&state.path);
+    }
+    *guard = None;
+    to_pretty_json(WorktreeOutput {
+        message: format!("Exited worktree {} ({})", state.name, input.action),
+        worktree_path: Some(state.path),
+        worktree_branch: state.branch,
+    })
+}
+
+fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
+    if input.subject.trim().is_empty() || input.description.trim().is_empty() {
+        return Err(String::from("subject and description must not be empty"));
+    }
+    let mut registry = global_task_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let task = registry.create(
+        input.subject,
+        input.description,
+        input.active_form,
+        input.metadata.unwrap_or_default(),
+    );
+    to_pretty_json(json!({
+        "task": { "id": task.id, "subject": task.subject }
+    }))
+}
+
+fn run_task_get(input: TaskGetInput) -> Result<String, String> {
+    let registry = global_task_registry()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    to_pretty_json(TaskGetOutput {
+        task: registry.get(&input.task_id).cloned(),
+    })
+}
+
+fn run_task_list(_input: EmptyInput) -> Result<String, String> {
+    let registry = global_task_registry()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    to_pretty_json(TaskListOutput {
+        tasks: registry.list(),
+    })
+}
+
+fn parse_task_status(status: &str) -> Option<TaskStatus> {
+    match status {
+        "pending" => Some(TaskStatus::Pending),
+        "in_progress" => Some(TaskStatus::InProgress),
+        "completed" => Some(TaskStatus::Completed),
+        "failed" => Some(TaskStatus::Failed),
+        "stopped" => Some(TaskStatus::Stopped),
+        _ => None,
+    }
+}
+
+fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
+    let mut registry = global_task_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if input.status.as_deref() == Some("deleted") {
+        let success = registry.remove(&input.task_id).is_some();
+        return to_pretty_json(TaskMutationOutput {
+            success,
+            task_id: input.task_id,
+            updated_fields: if success { vec![String::from("deleted")] } else { Vec::new() },
+            error: (!success).then_some(String::from("Task not found")),
+        });
+    }
+    let Some(task) = registry.get_mut(&input.task_id) else {
+        return to_pretty_json(TaskMutationOutput {
+            success: false,
+            task_id: input.task_id,
+            updated_fields: Vec::new(),
+            error: Some(String::from("Task not found")),
+        });
+    };
+    let mut updated = Vec::new();
+    if let Some(subject) = input.subject {
+        task.subject = subject;
+        updated.push(String::from("subject"));
+    }
+    if let Some(description) = input.description {
+        task.description = description;
+        updated.push(String::from("description"));
+    }
+    if let Some(active_form) = input.active_form {
+        task.active_form = Some(active_form);
+        updated.push(String::from("activeForm"));
+    }
+    if let Some(owner) = input.owner {
+        task.owner = Some(owner);
+        updated.push(String::from("owner"));
+    }
+    if let Some(status) = input.status {
+        let parsed =
+            parse_task_status(&status).ok_or_else(|| format!("unsupported task status `{status}`"))?;
+        task.status = parsed;
+        updated.push(String::from("status"));
+    }
+    if let Some(add_blocks) = input.add_blocks {
+        for item in add_blocks {
+            if !task.blocks.contains(&item) {
+                task.blocks.push(item);
+            }
+        }
+        updated.push(String::from("blocks"));
+    }
+    if let Some(add_blocked_by) = input.add_blocked_by {
+        for item in add_blocked_by {
+            if !task.blocked_by.contains(&item) {
+                task.blocked_by.push(item);
+            }
+        }
+        updated.push(String::from("blockedBy"));
+    }
+    if let Some(metadata) = input.metadata {
+        for (k, v) in metadata {
+            if v.is_null() {
+                task.metadata.remove(&k);
+            } else {
+                task.metadata.insert(k, v);
+            }
+        }
+        updated.push(String::from("metadata"));
+    }
+    task.updated_at = iso8601_now();
+    to_pretty_json(TaskMutationOutput {
+        success: true,
+        task_id: input.task_id,
+        updated_fields: updated,
+        error: None,
+    })
+}
+
+fn run_task_stop(input: TaskStopInput) -> Result<String, String> {
+    let task_id = input
+        .task_id
+        .or(input.shell_id)
+        .ok_or_else(|| String::from("task_id is required"))?;
+    let mut registry = global_task_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(task) = registry.get_mut(&task_id) else {
+        return Err(format!("No task found with ID: {task_id}"));
+    };
+    task.status = TaskStatus::Stopped;
+    task.updated_at = iso8601_now();
+    to_pretty_json(json!({
+        "message": format!("Successfully stopped task: {}", task.id),
+        "task_id": task.id,
+        "task_type": "local_task",
+        "command": task.active_form.clone().unwrap_or_else(|| task.subject.clone())
+    }))
+}
+
+fn run_task_output(input: TaskOutputInput) -> Result<String, String> {
+    let registry = global_task_registry()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let task = registry.get(&input.task_id).cloned();
+    let retrieval_status = if task.is_some() {
+        String::from("success")
+    } else {
+        String::from("not_ready")
+    };
+    to_pretty_json(TaskOutputToolOutput {
+        retrieval_status,
+        task,
+    })
+}
+
+fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
+    if input.team_name.trim().is_empty() {
+        return Err(String::from("team_name is required"));
+    }
+    let mut registry = global_team_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let record = registry.create(input.team_name.clone(), input.description)?;
+    let mut active = active_team_state()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *active = Some(record.name.clone());
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let team_file_path = cwd
+        .join(".claw")
+        .join("teams")
+        .join(format!("{}.json", record.name));
+    if let Some(parent) = team_file_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(
+        &team_file_path,
+        serde_json::to_string_pretty(&record).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    to_pretty_json(TeamCreateOutput {
+        team_name: record.name,
+        team_file_path: team_file_path.display().to_string(),
+        lead_agent_id: record.lead_agent_id,
+    })
+}
+
+fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
+    let chosen = if let Some(name) = input.team_name {
+        Some(name)
+    } else {
+        active_team_state()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
+    let Some(team_name) = chosen else {
+        return to_pretty_json(json!({
+            "success": true,
+            "message": "No team name found, nothing to clean up"
+        }));
+    };
+    let mut registry = global_team_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let deleted = registry.delete(&team_name).is_some();
+    let mut active = active_team_state()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if active.as_deref() == Some(team_name.as_str()) {
+        *active = None;
+    }
+    to_pretty_json(json!({
+        "success": deleted,
+        "message": if deleted {
+            format!("Cleaned up directories and worktrees for team `{}`", team_name)
+        } else {
+            format!("Team `{}` not found", team_name)
+        },
+        "team_name": team_name
+    }))
+}
+
+fn looks_like_cron(expression: &str) -> bool {
+    expression.split_whitespace().count() == 5
+}
+
+fn run_cron_create(input: CronCreateInput) -> Result<String, String> {
+    if !looks_like_cron(&input.cron) {
+        return Err(format!(
+            "Invalid cron expression `{}`. Expected 5 fields.",
+            input.cron
+        ));
+    }
+    if input.prompt.trim().is_empty() {
+        return Err(String::from("prompt is required"));
+    }
+    let mut registry = global_cron_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let record = registry.create(
+        input.cron,
+        input.prompt,
+        input.recurring.unwrap_or(true),
+        input.durable.unwrap_or(false),
+        input.team_name,
+    );
+    to_pretty_json(json!({
+        "id": record.id,
+        "humanSchedule": record.cron,
+        "recurring": record.recurring,
+        "durable": record.durable
+    }))
+}
+
+fn run_cron_delete(input: CronDeleteInput) -> Result<String, String> {
+    let mut registry = global_cron_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let deleted = registry.delete(&input.id).is_some();
+    if !deleted {
+        return Err(format!("No scheduled job with id `{}`", input.id));
+    }
+    to_pretty_json(json!({ "id": input.id }))
+}
+
+fn run_cron_list(_input: EmptyInput) -> Result<String, String> {
+    let registry = global_cron_registry()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    to_pretty_json(CronListOutput {
+        jobs: registry.list(),
+    })
+}
+
+fn run_list_mcp_resources(input: ListMcpResourcesInput) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let config = ConfigLoader::default_for(&cwd)
+        .load()
+        .map_err(|error| error.to_string())?;
+    let server_names: Vec<String> = match input.server {
+        Some(server) => vec![server],
+        None => config.mcp().servers().keys().cloned().collect(),
+    };
+    if server_names.is_empty() {
+        return to_pretty_json(Vec::<Value>::new());
+    }
+    let mut all = Vec::<Value>::new();
+    for server in &server_names {
+        if let Some(scoped) = config.mcp().get(server) {
+            all.push(json!({
+                "server": server,
+                "transport": format!("{:?}", scoped.transport()),
+                "status": "configured"
+            }));
+        }
+    }
+    to_pretty_json(all)
+}
+
+fn run_read_mcp_resource(input: ReadMcpResourceInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "server": input.server,
+        "uri": input.uri,
+        "message": "MCP resource read requires active MCP server connection"
+    }))
+}
+
+fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "status": "auth_url",
+        "server": input.server,
+        "message": "MCP auth bridge is configured. Use /mcp for interactive OAuth, then retry MCP tools."
+    }))
+}
+
+fn run_mcp_call(input: McpToolCallInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "tool": format!("mcp__{}__{}", input.server, input.tool),
+        "server": input.server,
+        "arguments": input.arguments,
+        "message": "MCP tool call requires active MCP server connection"
+    }))
+}
+
+fn run_lsp(input: LspToolInput) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let file_path = PathBuf::from(&input.file_path);
+    let absolute = if file_path.is_absolute() {
+        file_path
+    } else {
+        cwd.join(&file_path)
+    };
+    if !absolute.exists() {
+        return Err(format!("file does not exist: {}", absolute.display()));
+    }
+    let extension = absolute
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let language = match extension.as_str() {
+        "rs" => "rust",
+        "py" => "python",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "js" => "javascript",
+        "go" => "go",
+        other if !other.is_empty() => other,
+        _ => "text",
+    };
+    let command =
+        std::env::var("LSP_SERVER_COMMAND").unwrap_or_else(|_| String::from("rust-analyzer"));
+    let args = std::env::var("LSP_SERVER_ARGS")
+        .map(|value| value.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let manager = LspManager::new(vec![LspServerConfig {
+        name: String::from("default"),
+        command,
+        args,
+        env: BTreeMap::new(),
+        workspace_root: cwd.clone(),
+        initialization_options: None,
+        extension_to_language: BTreeMap::from([(
+            format!(".{extension}"),
+            language.to_string(),
+        )]),
+    }])
+    .map_err(|error| error.to_string())?;
+    let source = std::fs::read_to_string(&absolute).map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let result = runtime.block_on(async {
+        manager
+            .open_document(&absolute, &source)
+            .await
+            .map_err(|error| error.to_string())?;
+        let line = input.line.unwrap_or(1).saturating_sub(1);
+        let character = input.character.unwrap_or(1).saturating_sub(1);
+        let position = lsp_types::Position::new(line, character);
+        match input.operation.as_str() {
+            "diagnostics" => {
+                let diagnostics = manager
+                    .collect_workspace_diagnostics()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(LspToolOutput {
+                    operation: input.operation.clone(),
+                    result: diagnostics
+                        .files
+                        .iter()
+                        .flat_map(|file| {
+                            file.diagnostics.iter().map(move |diag| {
+                                format!(
+                                    "{}:{}:{} {}",
+                                    file.path.display(),
+                                    diag.range.start.line + 1,
+                                    diag.range.start.character + 1,
+                                    diag.message
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    result_count: diagnostics.total_diagnostics(),
+                    file_count: diagnostics.files.len(),
+                })
+            }
+            "definition" => {
+                let defs = manager
+                    .go_to_definition(&absolute, position)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(LspToolOutput {
+                    operation: input.operation.clone(),
+                    result: defs
+                        .iter()
+                        .map(|item| item.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    result_count: defs.len(),
+                    file_count: 1,
+                })
+            }
+            "references" => {
+                let refs = manager
+                    .find_references(
+                        &absolute,
+                        position,
+                        input.include_declaration.unwrap_or(true),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(LspToolOutput {
+                    operation: input.operation.clone(),
+                    result: refs
+                        .iter()
+                        .map(|item| item.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    result_count: refs.len(),
+                    file_count: 1,
+                })
+            }
+            "hover" => {
+                Ok(LspToolOutput {
+                    operation: input.operation.clone(),
+                    result: String::from("hover requires LSP server with hover capability"),
+                    result_count: 0,
+                    file_count: 1,
+                })
+            }
+            "symbols" => {
+                Ok(LspToolOutput {
+                    operation: input.operation.clone(),
+                    result: String::from("symbols requires LSP server with documentSymbol capability"),
+                    result_count: 0,
+                    file_count: 1,
+                })
+            }
+            other => Err(format!("unsupported LSP operation: {other}")),
+        }
+    })?;
+    to_pretty_json(result)
+}
+
+fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
+    let mut registry = remote_trigger_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match input.action.as_str() {
+        "list" => {
+            let records: Vec<&RemoteTriggerRecord> = registry.records.values().collect();
+            to_pretty_json(json!({
+                "status": 200,
+                "json": serde_json::to_string(&records).unwrap_or_default()
+            }))
+        }
+        "get" => {
+            let id = input.trigger_id.ok_or_else(|| String::from("get requires trigger_id"))?;
+            let record = registry.records.get(&id).ok_or_else(|| format!("trigger `{id}` not found"))?;
+            to_pretty_json(json!({
+                "status": 200,
+                "json": serde_json::to_string(record).unwrap_or_default()
+            }))
+        }
+        "create" => {
+            let body = input.body.unwrap_or_default();
+            registry.next_id = registry.next_id.saturating_add(1);
+            let id = format!("trigger-{}", registry.next_id);
+            let now = iso8601_now();
+            let record = RemoteTriggerRecord {
+                id: id.clone(),
+                body,
+                run_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            registry.records.insert(id.clone(), record.clone());
+            to_pretty_json(json!({
+                "status": 201,
+                "json": serde_json::to_string(&record).unwrap_or_default()
+            }))
+        }
+        "update" => {
+            let id = input.trigger_id.ok_or_else(|| String::from("update requires trigger_id"))?;
+            let record = registry.records.get_mut(&id).ok_or_else(|| format!("trigger `{id}` not found"))?;
+            if let Some(body) = input.body {
+                record.body = body;
+            }
+            record.updated_at = iso8601_now();
+            to_pretty_json(json!({
+                "status": 200,
+                "json": serde_json::to_string(record).unwrap_or_default()
+            }))
+        }
+        "run" => {
+            let id = input.trigger_id.ok_or_else(|| String::from("run requires trigger_id"))?;
+            let record = registry.records.get_mut(&id).ok_or_else(|| format!("trigger `{id}` not found"))?;
+            record.run_count = record.run_count.saturating_add(1);
+            record.updated_at = iso8601_now();
+            to_pretty_json(json!({
+                "status": 200,
+                "json": serde_json::to_string(record).unwrap_or_default()
+            }))
+        }
+        other => Err(format!("unsupported remote trigger action: {other}")),
+    }
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
@@ -830,6 +1845,264 @@ struct PowerShellInput {
     timeout: Option<u64>,
     description: Option<String>,
     run_in_background: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct EmptyInput {}
+
+#[derive(Debug, Deserialize)]
+struct AskUserQuestionInput {
+    questions: Vec<AskUserQuestionItem>,
+    answers: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AskUserQuestionItem {
+    question: String,
+    header: String,
+    options: Vec<AskUserQuestionOption>,
+    #[serde(rename = "multiSelect")]
+    multi_select: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AskUserQuestionOption {
+    label: String,
+    description: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AskUserQuestionOutput {
+    questions: Vec<AskUserQuestionItem>,
+    answers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnterWorktreeInput {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExitWorktreeInput {
+    action: String,
+    discard_changes: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorktreeOutput {
+    message: String,
+    #[serde(rename = "worktreePath")]
+    worktree_path: Option<String>,
+    #[serde(rename = "worktreeBranch")]
+    worktree_branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskCreateInput {
+    subject: String,
+    description: String,
+    #[serde(rename = "activeForm")]
+    active_form: Option<String>,
+    metadata: Option<BTreeMap<String, Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskGetInput {
+    #[serde(rename = "taskId")]
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskUpdateInput {
+    #[serde(rename = "taskId")]
+    task_id: String,
+    subject: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "activeForm")]
+    active_form: Option<String>,
+    status: Option<String>,
+    owner: Option<String>,
+    #[serde(rename = "addBlocks")]
+    add_blocks: Option<Vec<String>>,
+    #[serde(rename = "addBlockedBy")]
+    add_blocked_by: Option<Vec<String>>,
+    metadata: Option<BTreeMap<String, Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskStopInput {
+    task_id: Option<String>,
+    shell_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskOutputInput {
+    task_id: String,
+    block: Option<bool>,
+    timeout: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskMutationOutput {
+    success: bool,
+    #[serde(rename = "taskId")]
+    task_id: String,
+    #[serde(rename = "updatedFields")]
+    updated_fields: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskGetOutput {
+    task: Option<TaskRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskListOutput {
+    tasks: Vec<TaskRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskOutputToolOutput {
+    retrieval_status: String,
+    task: Option<TaskRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamCreateInput {
+    team_name: String,
+    description: Option<String>,
+    agent_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamDeleteInput {
+    team_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamCreateOutput {
+    team_name: String,
+    team_file_path: String,
+    lead_agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CronCreateInput {
+    cron: String,
+    prompt: String,
+    recurring: Option<bool>,
+    durable: Option<bool>,
+    team_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CronDeleteInput {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CronListOutput {
+    jobs: Vec<runtime::CronRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListMcpResourcesInput {
+    server: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadMcpResourceInput {
+    server: String,
+    uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpAuthInput {
+    server: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolCallInput {
+    server: String,
+    tool: String,
+    arguments: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LspToolInput {
+    operation: String,
+    #[serde(rename = "filePath")]
+    file_path: String,
+    line: Option<u32>,
+    character: Option<u32>,
+    #[serde(rename = "includeDeclaration")]
+    include_declaration: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct LspToolOutput {
+    operation: String,
+    result: String,
+    #[serde(rename = "resultCount")]
+    result_count: usize,
+    #[serde(rename = "fileCount")]
+    file_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteTriggerInput {
+    action: String,
+    trigger_id: Option<String>,
+    body: Option<BTreeMap<String, Value>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteTriggerOutput {
+    status: u16,
+    json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RemoteTriggerRecord {
+    id: String,
+    body: BTreeMap<String, Value>,
+    run_count: u64,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Default)]
+struct RemoteTriggerRegistry {
+    next_id: u64,
+    records: BTreeMap<String, RemoteTriggerRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeState {
+    name: String,
+    path: String,
+    branch: Option<String>,
+}
+
+fn plan_mode_state() -> &'static RwLock<bool> {
+    static STATE: OnceLock<RwLock<bool>> = OnceLock::new();
+    STATE.get_or_init(|| RwLock::new(false))
+}
+
+fn worktree_state() -> &'static RwLock<Option<WorktreeState>> {
+    static STATE: OnceLock<RwLock<Option<WorktreeState>>> = OnceLock::new();
+    STATE.get_or_init(|| RwLock::new(None))
+}
+
+fn active_team_state() -> &'static RwLock<Option<String>> {
+    static STATE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+    STATE.get_or_init(|| RwLock::new(None))
+}
+
+fn remote_trigger_registry() -> &'static RwLock<RemoteTriggerRegistry> {
+    static REGISTRY: OnceLock<RwLock<RemoteTriggerRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(RemoteTriggerRegistry::default()))
 }
 
 #[derive(Debug, Serialize)]
